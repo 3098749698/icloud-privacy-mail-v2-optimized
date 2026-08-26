@@ -950,6 +950,29 @@ func (s *Service) applyMailboxSync(refreshed []domain.Mailbox, messagesByMailbox
 	return created, nil
 }
 
+// ApplyIMAPEventMessages durably stores messages fetched by an existing IMAP
+// watcher connection and wakes code waiters. It deliberately does not advance
+// account cursors: the scheduled fallback scan remains the cursor authority and
+// RemoteID de-duplication makes an overlapping fallback fetch harmless.
+func (s *Service) ApplyIMAPEventMessages(mailboxes []domain.Mailbox, messagesByMailbox map[string][]protocol.ICloudSyncedMessage) (int, error) {
+	refreshed := make([]domain.Mailbox, 0, len(mailboxes))
+	filtered := make(map[string][]protocol.ICloudSyncedMessage, len(messagesByMailbox))
+	for _, mailbox := range mailboxes {
+		current, ok := s.store.FindMailboxByID(mailbox.ID)
+		if !ok {
+			continue
+		}
+		refreshed = append(refreshed, current)
+		if messages := messagesByMailbox[mailbox.ID]; len(messages) > 0 {
+			filtered[mailbox.ID] = messages
+		}
+	}
+	if len(refreshed) == 0 || len(filtered) == 0 {
+		return 0, nil
+	}
+	return s.applyMailboxSync(refreshed, filtered, "", "imap")
+}
+
 // CodeChanges returns the current generation channel for a mailbox. Writers
 // close and replace it after durable message persistence, so waiters need no
 // per-request registration or cleanup.

@@ -467,17 +467,25 @@ func CheckIMAPLogin(ctx context.Context, state LoginState) error {
 }
 
 func WatchICloudIMAPExists(ctx context.Context, state LoginState, onReady, onExists func()) error {
-	return watchICloudIMAPMailboxExists(ctx, state, "INBOX", onReady, onExists)
+	return watchICloudIMAPMailboxExists(ctx, state, "INBOX", nil, "", 0, onReady, onExists, nil)
 }
 
 // WatchICloudIMAPJunkExists keeps a second QQ IMAP connection selected on the
 // Junk folder. INBOX IDLE does not receive EXISTS events for messages that QQ
 // classifies directly as junk.
 func WatchICloudIMAPJunkExists(ctx context.Context, state LoginState, onReady, onExists func()) error {
-	return watchICloudIMAPMailboxExists(ctx, state, "junk", onReady, onExists)
+	return watchICloudIMAPMailboxExists(ctx, state, "junk", nil, "", 0, onReady, onExists, nil)
 }
 
-func watchICloudIMAPMailboxExists(ctx context.Context, state LoginState, watchFolder string, onReady, onExists func()) error {
+// WatchICloudIMAPJunkMessages uses the already-authenticated Junk watcher
+// connection to fetch only UIDs newly visible in QQ Junk. The callback runs
+// after parsing and recipient matching, without entering the account scan
+// coordinator or opening another IMAP connection.
+func WatchICloudIMAPJunkMessages(ctx context.Context, state LoginState, mailboxes []Mailbox, keyword string, maxMessages int, onReady func(), onMessages func(map[string][]ICloudSyncedMessage) error) error {
+	return watchICloudIMAPMailboxExists(ctx, state, "junk", mailboxes, keyword, maxMessages, onReady, nil, onMessages)
+}
+
+func watchICloudIMAPMailboxExists(ctx context.Context, state LoginState, watchFolder string, mailboxes []Mailbox, keyword string, maxMessages int, onReady, onExists func(), onMessages func(map[string][]ICloudSyncedMessage) error) error {
 	state, err := PrepareIMAPLoginState(ctx, state)
 	if err != nil {
 		return err
@@ -544,16 +552,63 @@ func watchICloudIMAPMailboxExists(ctx context.Context, state LoginState, watchFo
 	lastUID := imapSelectLastUID(selectLines)
 	watchingJunk := strings.EqualFold(strings.TrimSpace(watchFolder), "junk")
 	lastJunkFingerprint := ""
+	var lastJunkUIDs []int
 	if watchingJunk {
 		searchTag := nextTag()
 		lines, searchErr := imapCommand(conn, reader, searchTag, "UID SEARCH ALL")
 		if searchErr != nil {
 			return searchErr
 		}
-		lastJunkFingerprint = imapUIDFingerprint(lines, 16)
+		lastJunkUIDs = imapRecentUIDs(lines, 32)
+		lastJunkFingerprint = imapUIDValuesFingerprint(lastJunkUIDs)
 		if currentUID := imapMaxUID(lines); currentUID > lastUID {
 			lastUID = currentUID
 		}
+	}
+	probeJunk := func() error {
+		searchTag := nextTag()
+		lines, searchErr := imapCommand(conn, reader, searchTag, "UID SEARCH ALL")
+		if searchErr != nil {
+			return searchErr
+		}
+		currentUID := imapMaxUID(lines)
+		currentUIDs := imapRecentUIDs(lines, 32)
+		fingerprint := imapUIDValuesFingerprint(currentUIDs)
+		changed := currentUID > lastUID || (lastJunkFingerprint != "" && fingerprint != lastJunkFingerprint)
+		addedUIDs := imapUIDDifference(currentUIDs, lastJunkUIDs)
+		lastJunkUIDs = currentUIDs
+		lastJunkFingerprint = fingerprint
+		if currentUID > lastUID {
+			lastUID = currentUID
+		}
+		if !changed {
+			return nil
+		}
+		if onMessages != nil && len(addedUIDs) > 0 {
+			fetchLimit := maxMessages
+			if fetchLimit <= 0 || fetchLimit > qqJunkEventFetchMax {
+				fetchLimit = qqJunkEventFetchMax
+			}
+			addedUIDs = lastIntValues(addedUIDs, fetchLimit)
+			fetched, fetchErr := fetchSelectedIMAPUIDs(conn, reader, nextTag, addedUIDs, "junk")
+			if fetchErr != nil {
+				return fetchErr
+			}
+			matchedMailboxes := append([]Mailbox(nil), mailboxes...)
+			for i := range matchedMailboxes {
+				matchedMailboxes[i].LastSyncAt = time.Time{}
+			}
+			after := time.Now().Add(-24 * time.Hour)
+			messages := iCloudIMAPMessagesByMailbox(fetched, matchedMailboxes, after, keyword, state.IMAPEmail, state.IMAPUsername)
+			if len(messages) > 0 {
+				return onMessages(messages)
+			}
+			return nil
+		}
+		if onExists != nil {
+			onExists()
+		}
+		return nil
 	}
 	if onReady != nil {
 		onReady()
@@ -571,27 +626,20 @@ func watchICloudIMAPMailboxExists(ctx context.Context, state LoginState, watchFo
 			}
 			if errors.Is(err, errIMAPIdleRenew) {
 				if watchingJunk {
-					searchTag := nextTag()
-					lines, searchErr := imapCommand(conn, reader, searchTag, "UID SEARCH ALL")
-					if searchErr != nil {
-						return searchErr
-					}
-					currentUID := imapMaxUID(lines)
-					fingerprint := imapUIDFingerprint(lines, 16)
-					changed := currentUID > lastUID || (lastJunkFingerprint != "" && fingerprint != lastJunkFingerprint)
-					if changed && onExists != nil {
-						onExists()
-					}
-					lastJunkFingerprint = fingerprint
-					if currentUID > lastUID {
-						lastUID = currentUID
+					if probeErr := probeJunk(); probeErr != nil {
+						return probeErr
 					}
 				}
 				continue
 			}
 			return err
 		}
-		if onExists != nil {
+		_ = conn.SetReadDeadline(time.Time{})
+		if watchingJunk {
+			if probeErr := probeJunk(); probeErr != nil {
+				return probeErr
+			}
+		} else if onExists != nil {
 			onExists()
 		}
 		lastExists++
@@ -677,17 +725,38 @@ func imapMaxUID(lines []string) int {
 }
 
 func imapUIDFingerprint(lines []string, limit int) string {
+	return imapUIDValuesFingerprint(imapRecentUIDs(lines, limit))
+}
+
+func imapRecentUIDs(lines []string, limit int) []int {
 	uids := imapSearchUIDs(lines)
 	if len(uids) == 0 {
-		return ""
+		return nil
 	}
 	sortInts(uids)
-	uids = lastIntValues(uids, limit)
+	return lastIntValues(uids, limit)
+}
+
+func imapUIDValuesFingerprint(uids []int) string {
 	parts := make([]string, 0, len(uids))
 	for _, uid := range uids {
 		parts = append(parts, strconv.Itoa(uid))
 	}
 	return strings.Join(parts, ",")
+}
+
+func imapUIDDifference(current, previous []int) []int {
+	seen := make(map[int]struct{}, len(previous))
+	for _, uid := range previous {
+		seen[uid] = struct{}{}
+	}
+	added := make([]int, 0, len(current))
+	for _, uid := range current {
+		if _, ok := seen[uid]; !ok {
+			added = append(added, uid)
+		}
+	}
+	return added
 }
 
 func imapReadUntilTag(reader *bufio.Reader, tag string) ([]string, error) {
@@ -1049,15 +1118,23 @@ func syncSelectedIMAPMailboxFiltered(conn net.Conn, reader *bufio.Reader, nextTa
 			return nil, lastUID, nil
 		}
 	}
+	fetched, fetchErr := fetchSelectedIMAPUIDs(conn, reader, nextTag, uids, remoteFolder)
+	if fetchErr != nil {
+		return nil, "", fetchErr
+	}
+	return fetched, lastUID, nil
+}
+
+func fetchSelectedIMAPUIDs(conn net.Conn, reader *bufio.Reader, nextTag func() string, uids []int, remoteFolder string) ([]iCloudIMAPFetchedMessage, error) {
 	fetched := make([]iCloudIMAPFetchedMessage, 0, len(uids))
 	for _, chunk := range chunkInts(uids, 20) {
 		fetchTag := nextTag()
 		lines, literals, fetchErr := imapCommandWithLiterals(conn, reader, fetchTag, "UID FETCH "+imapUIDSet(chunk)+" (UID INTERNALDATE BODY.PEEK[]<0.200000>)")
 		if fetchErr != nil {
-			return nil, "", errCode("imap_fetch_failed", "读取 IMAP 邮件失败："+fetchErr.Error(), true)
+			return nil, errCode("imap_fetch_failed", "读取 IMAP 邮件失败："+fetchErr.Error(), true)
 		}
 		if !imapTaggedOK(lines, fetchTag) {
-			return nil, "", errCode("imap_fetch_failed", "读取 IMAP 邮件失败："+imapResponseSummary(lines), true)
+			return nil, errCode("imap_fetch_failed", "读取 IMAP 邮件失败："+imapResponseSummary(lines), true)
 		}
 		fetchUIDs := imapFetchUIDs(lines)
 		internalDates := imapFetchInternalDates(lines)
@@ -1072,7 +1149,7 @@ func syncSelectedIMAPMailboxFiltered(conn net.Conn, reader *bufio.Reader, nextTa
 			fetched = append(fetched, iCloudIMAPFetchedMessage{UID: uid, Folder: remoteFolder, Raw: raw, ProviderReceivedAt: providerReceivedAt})
 		}
 	}
-	return fetched, lastUID, nil
+	return fetched, nil
 }
 
 func imapJunkHeaderCandidate(raw []byte, mailboxes []Mailbox, keyword string, ignoredEmails ...string) bool {

@@ -359,6 +359,52 @@ func TestConcurrentCodeConsumersClaimMessageOnce(t *testing.T) {
 	}
 }
 
+func TestApplyIMAPEventMessagesPersistsAndWakesCodeWaiter(t *testing.T) {
+	state, err := store.Open(filepath.Join(t.TempDir(), "state.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	mailbox, _, err := state.UpsertMailboxFromRemote("account_fixture", domain.RemoteMailbox{Email: "junk-event@icloud.com", IsActive: true}, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	service := NewService(config.Default(), state)
+	wakeup := service.CodeChanges(mailbox.ID)
+	providerReceivedAt := time.Now().Add(-time.Second).Round(time.Second)
+	count, err := service.ApplyIMAPEventMessages([]domain.Mailbox{mailbox}, map[string][]protocol.ICloudSyncedMessage{
+		mailbox.ID: {{
+			RemoteID:           "imap:junk:991",
+			UID:                "991",
+			Subject:            "OpenAI verification code 482913",
+			From:               "noreply@openai.com",
+			Body:               "Your code is 482913",
+			ReceivedAt:         providerReceivedAt,
+			ProviderReceivedAt: providerReceivedAt,
+		}},
+	})
+	if err != nil {
+		t.Fatalf("apply event messages: %v", err)
+	}
+	if count != 1 {
+		t.Fatalf("created messages = %d, want 1", count)
+	}
+	select {
+	case <-wakeup:
+	case <-time.After(time.Second):
+		t.Fatal("code waiter was not notified after direct event persistence")
+	}
+	result, found, err := service.CachedCodeWithQuery(mailbox.ID, CodeQuery{})
+	if err != nil || !found {
+		t.Fatalf("cached code found=%v err=%v", found, err)
+	}
+	if result.Code != "482913" || result.Folder != "junk" {
+		t.Fatalf("unexpected code result: %+v", result)
+	}
+	if result.ProviderReceivedAt == nil || !result.ProviderReceivedAt.Equal(providerReceivedAt) {
+		t.Fatalf("provider INTERNALDATE not preserved: %+v", result.ProviderReceivedAt)
+	}
+}
+
 func TestMergeIMAPCursorPreservesConcurrentTokenAndDoesNotRegress(t *testing.T) {
 	current := domain.ICloudSession{
 		LoginStates: []domain.LoginState{{

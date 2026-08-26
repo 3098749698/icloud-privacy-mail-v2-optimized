@@ -465,11 +465,7 @@ func (s *Service) runIdleWorker(ctx context.Context, group watchGroup, target id
 			}
 			continue
 		}
-		watch := protocol.WatchICloudIMAPExists
-		if target.folder == idleFolderJunk {
-			watch = protocol.WatchICloudIMAPJunkExists
-		}
-		err := watch(workerCtx, group.state, func() {
+		onReady := func() {
 			s.markWorkerReady(target.key, token, true)
 			s.updateStatus(func(status *Status) {
 				status.LastIdleConnectedAt = time.Now()
@@ -482,7 +478,8 @@ func (s *Service) runIdleWorker(ctx context.Context, group watchGroup, target id
 			if target.folder == idleFolderInbox {
 				requestIdleSync(readySignals)
 			}
-		}, func() {
+		}
+		onExists := func() {
 			if workerCtx.Err() != nil {
 				return
 			}
@@ -494,7 +491,24 @@ func (s *Service) runIdleWorker(ctx context.Context, group watchGroup, target id
 			// per-worker sync loop fetches mail on its own connection. A buffered
 			// request preserves one trailing sync when EXISTS arrives mid-sync.
 			requestIdleSync(eventRequests)
-		})
+		}
+		var err error
+		if target.folder == idleFolderJunk {
+			err = protocol.WatchICloudIMAPJunkMessages(workerCtx, group.state, group.mailboxes, "OpenAI", mailWatcherIdleFetchLimit(s.cfg.MailWatcherFetchLimit), onReady, func(messages map[string][]protocol.ICloudSyncedMessage) error {
+				if workerCtx.Err() != nil {
+					return workerCtx.Err()
+				}
+				s.updateStatus(func(status *Status) {
+					status.IdleEvents++
+					status.LastIdleEventAt = time.Now()
+				})
+				count, applyErr := s.mailbox.ApplyIMAPEventMessages(group.mailboxes, messages)
+				s.recordSyncResult(count, applyErr)
+				return applyErr
+			})
+		} else {
+			err = protocol.WatchICloudIMAPExists(workerCtx, group.state, onReady, onExists)
+		}
 		s.markWorkerReady(target.key, token, false)
 		if workerCtx.Err() != nil {
 			return
