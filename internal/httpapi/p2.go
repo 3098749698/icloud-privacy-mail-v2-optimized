@@ -223,40 +223,52 @@ func (s *Server) handlePublicMailboxCode(w http.ResponseWriter, r *http.Request)
 		writeCodeError(w, http.StatusOK, "no_code", "暂未收到验证码", diagnostics.meta("cache", mailbox.LastSyncAt))
 		return
 	}
-	// Cache-only and zero-wait requests remain local and fast. A waiting caller
-	// starts one targeted fresh scan; the mailbox service coalesces concurrent
-	// callers by account.
-	diagnostics.beginSync()
-
+	if s.observeMailbox != nil {
+		s.observeMailbox(mailbox.ID)
+	}
+	changes := s.mailbox.CodeChanges(mailbox.ID)
+	if s.codeChanges != nil {
+		changes = s.codeChanges(mailbox.ID)
+	}
+	// Subscribe before the second lookup so a message committed between the
+	// first cache check and subscription cannot be missed.
+	if result, found, lookupErr := s.mailbox.CachedCodeWithQuery(mailbox.ID, query); lookupErr != nil {
+		writeServiceError(w, lookupErr)
+		return
+	} else if found {
+		s.writeObservedCodeSuccess(w, result, diagnostics, "cache-after-subscribe", mailbox.LastSyncAt)
+		return
+	}
+	idleReady := false
+	if s.mailboxIdleReady != nil {
+		idleReady = s.mailboxIdleReady(mailbox.ID)
+	}
+	diagnostics.idleReady = idleReady
+	diagnostics.fetchMode = "idle-targeted"
+	var fallbackDone <-chan error
+	if !idleReady {
+		diagnostics.fetchMode = "fallback"
+		diagnostics.beginSync()
+		fallbackDone = s.startCodeFallback(mailbox)
+	}
 	deadline := time.NewTimer(time.Duration(waitMS) * time.Millisecond)
 	defer deadline.Stop()
-	poll := time.NewTicker(200 * time.Millisecond)
-	defer poll.Stop()
-	resyncInterval := s.codeResyncInterval
-	if resyncInterval <= 0 {
-		resyncInterval = 2 * time.Second
-	}
-	resync := time.NewTicker(resyncInterval)
-	defer resync.Stop()
-	// Every waiting request gets at least one scan round that starts after the
-	// request. Concurrent callers still coalesce by account inside the mailbox
-	// service, so this does not open one IMAP connection per caller.
-	startSync := func() <-chan error {
-		done := make(chan error, 1)
-		go func() {
-			syncCtx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
-			defer cancel()
-			syncFresh := s.syncMailboxFresh
-			if syncFresh == nil {
-				syncFresh = s.mailbox.SyncMessagesFresh
-			}
-			_, syncErr := syncFresh(syncCtx, mailbox.ID)
-			done <- syncErr
-		}()
-		return done
-	}
-	syncDone := startSync()
+	localSafetyCheck := time.NewTicker(100 * time.Millisecond)
+	defer localSafetyCheck.Stop()
 	var syncErr error
+	lookup := func(source string) bool {
+		latestMailbox, _ := s.store.FindMailboxByID(mailbox.ID)
+		result, found, lookupErr := s.mailbox.CachedCodeWithQuery(mailbox.ID, query)
+		if lookupErr != nil {
+			writeServiceError(w, lookupErr)
+			return true
+		}
+		if found {
+			s.writeObservedCodeSuccess(w, result, diagnostics, source, latestMailbox.LastSyncAt)
+			return true
+		}
+		return false
+	}
 	for {
 		select {
 		case <-r.Context().Done():
@@ -283,18 +295,14 @@ func (s *Server) handlePublicMailboxCode(w http.ResponseWriter, r *http.Request)
 			}
 			writeCodeError(w, http.StatusOK, "no_code", "暂未收到验证码", diagnostics.meta("sync", latestMailbox.LastSyncAt))
 			return
-		case syncErr = <-syncDone:
+		case syncErr = <-fallbackDone:
 			diagnostics.endSync()
-			syncDone = nil
-			latestMailbox, _ := s.store.FindMailboxByID(mailbox.ID)
-			if result, found, lookupErr := s.mailbox.CachedCodeWithQuery(mailbox.ID, query); lookupErr != nil {
-				writeServiceError(w, lookupErr)
-				return
-			} else if found {
-				s.writeObservedCodeSuccess(w, result, diagnostics, "sync", latestMailbox.LastSyncAt)
+			fallbackDone = nil
+			if lookup("fallback") {
 				return
 			}
 			if syncErr != nil && allowStale {
+				latestMailbox, _ := s.store.FindMailboxByID(mailbox.ID)
 				if result, found, lookupErr := s.staleCachedCode(mailbox.ID, query); lookupErr != nil {
 					writeServiceError(w, lookupErr)
 					return
@@ -307,21 +315,58 @@ func (s *Server) handlePublicMailboxCode(w http.ResponseWriter, r *http.Request)
 			// still able to cache the incoming message. Keep polling until the
 			// caller's deadline instead of turning the first transport error into
 			// a terminal result.
-		case <-poll.C:
-			latestMailbox, _ := s.store.FindMailboxByID(mailbox.ID)
-			if result, found, lookupErr := s.mailbox.CachedCodeWithQuery(mailbox.ID, query); lookupErr != nil {
-				writeServiceError(w, lookupErr)
-				return
-			} else if found {
-				s.writeObservedCodeSuccess(w, result, diagnostics, "sync", latestMailbox.LastSyncAt)
+		case <-changes:
+			if s.codeChanges != nil {
+				changes = s.codeChanges(mailbox.ID)
+			} else {
+				changes = s.mailbox.CodeChanges(mailbox.ID)
+			}
+			if lookup("idle-targeted") {
 				return
 			}
-		case <-resync.C:
-			if syncDone == nil {
-				syncDone = startSync()
+		case <-localSafetyCheck.C:
+			if lookup(diagnostics.fetchMode) {
+				return
 			}
 		}
 	}
+}
+
+func (s *Server) startCodeFallback(mailbox domain.Mailbox) <-chan error {
+	key := firstNonEmpty(mailbox.AccountID, mailbox.OwnerID, mailbox.ID)
+	now := time.Now()
+	s.codeFallbackMu.Lock()
+	if running := s.codeFallbacks[key]; running != nil {
+		done := running.done
+		s.codeFallbackMu.Unlock()
+		return done
+	}
+	if last := s.codeFallbackLast[key]; !last.IsZero() && now.Sub(last) < 10*time.Second {
+		done := make(chan error, 1)
+		done <- nil
+		close(done)
+		s.codeFallbackMu.Unlock()
+		return done
+	}
+	call := &codeFallbackCall{done: make(chan error, 1)}
+	s.codeFallbacks[key] = call
+	s.codeFallbackLast[key] = now
+	s.codeFallbackMu.Unlock()
+	go func() {
+		syncCtx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+		defer cancel()
+		syncFresh := s.syncMailboxFresh
+		if syncFresh == nil {
+			syncFresh = s.mailbox.SyncMessagesFresh
+		}
+		_, syncErr := syncFresh(syncCtx, mailbox.ID)
+		call.done <- syncErr
+		close(call.done)
+		s.codeFallbackMu.Lock()
+		delete(s.codeFallbacks, key)
+		s.codeFallbackMu.Unlock()
+	}()
+	return call.done
 }
 
 func (s *Server) handlePublicCodePageStatus(w http.ResponseWriter, _ *http.Request) {
@@ -357,10 +402,21 @@ func (s *Server) staleCachedCode(mailboxID string, query mailboxservice.CodeQuer
 func staleCodeData(result mailboxservice.CodeResult) map[string]any {
 	return map[string]any{
 		"email": result.Email, "code": result.Code, "subject": result.Subject, "from": result.From,
-		"received_at": result.ReceivedAt, "detected_at": result.DetectedAt, "delivery_delay_ms": result.DeliveryDelayMS,
-		"message_id": result.MessageID, "folder": result.Folder, "stale_cache": true,
+		"received_at": result.ReceivedAt, "message_date_at": result.MessageDateAt,
+		"provider_received_at": result.ProviderReceivedAt, "detected_at": result.DetectedAt, "delivery_delay_ms": result.DeliveryDelayMS,
+		"api_returned_at": time.Now(),
+		"message_id":      result.MessageID, "folder": result.Folder, "stale_cache": true,
 		"sync_error": "同步验证码邮件失败，当前验证码来自本地缓存",
 	}
+}
+
+func firstNonEmpty(values ...string) string {
+	for _, value := range values {
+		if value = strings.TrimSpace(value); value != "" {
+			return value
+		}
+	}
+	return ""
 }
 
 func (s *Server) handleSchedulerStatus(w http.ResponseWriter, _ *http.Request) {

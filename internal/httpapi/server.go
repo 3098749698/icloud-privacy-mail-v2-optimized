@@ -64,7 +64,16 @@ type Server struct {
 	keepAliveTargets    map[string]appleKeepAliveTarget
 	keepAliveIntervalFn func(time.Duration, int) time.Duration
 	syncMailboxFresh    func(context.Context, string) (int, error)
-	codeResyncInterval  time.Duration
+	mailboxIdleReady    func(string) bool
+	observeMailbox      func(string)
+	codeChanges         func(string) <-chan struct{}
+	codeFallbackMu      sync.Mutex
+	codeFallbacks       map[string]*codeFallbackCall
+	codeFallbackLast    map[string]time.Time
+}
+
+type codeFallbackCall struct {
+	done chan error
 }
 
 func New(cfg config.Config, state *store.Store, logger *slog.Logger) *Server {
@@ -91,7 +100,11 @@ func New(cfg config.Config, state *store.Store, logger *slog.Logger) *Server {
 	s.keepAliveState = s.apple.KeepAliveState
 	s.keepAliveIntervalFn = randomAppleKeepAliveInterval
 	s.syncMailboxFresh = s.mailbox.SyncMessagesFresh
-	s.codeResyncInterval = 2 * time.Second
+	s.mailboxIdleReady = s.watcher.MailboxIdleReady
+	s.observeMailbox = s.watcher.Observe
+	s.codeChanges = s.mailbox.CodeChanges
+	s.codeFallbacks = make(map[string]*codeFallbackCall)
+	s.codeFallbackLast = make(map[string]time.Time)
 	s.routes()
 	return s
 }

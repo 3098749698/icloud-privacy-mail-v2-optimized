@@ -170,6 +170,14 @@ iCloud-Privacy-Mail-v2/
 
 `commit` 才会执行 `reserved → used`；`release` 和超时回收会恢复为 `available`。动作请求均需提交全局 API Key 和 `project`。`claim`、`commit`、`release` 支持幂等重试，备注使用 `note` 字段。旧版按邮箱调用的 `/api/v1/mailboxes/{email}/commit|release|renew` 继续作为兼容入口。
 
+### 验证码低延迟时间线
+
+邮箱取码接口优先等待 IMAP IDLE 事件，不会为每个长轮询请求重复扫描 QQ 邮箱。成功响应保留兼容字段 `received_at`，并增加 `message_date_at`、`provider_received_at`、`detected_at`、`api_returned_at`；`meta` 中提供 `provider_to_detect_ms`、`detect_to_response_ms`、`idle_ready` 和 `fetch_mode`。其中 `provider_received_at` 来自 QQ IMAP `INTERNALDATE`，应使用它评估 QQ 已入箱后的程序读取延迟。
+
+注册调用方建议使用 `wait_ms=30000&preview=1` 长轮询，并在发送验证码时提交带少量时钟容差的 `after`。正常长轮询返回 `no_code` 后可以立即重连；快速失败和网络错误应遵循 `retry_after_ms` 或指数退避。
+
+仓库中的 `tools/chatgpt_register.py` 是配套的独立协议客户端示例，需与 `tools/sentinel-runtime.mjs` 放在同一目录。它会把取码服务返回的完整时间线写入结果 JSON，便于分别统计外部投递、QQ 入箱到程序检测以及接口返回延迟。
+
 ## 数据与安全
 
 状态默认保存在 `data/state.json`，包含 Apple Cookie、登录态、IMAP 授权密码、Microsoft OAuth Token、邮箱 API Token 和公共 API Key。Apple 账号重登录密码使用 AES-256-GCM 加密，独立密钥保存在同目录的 `state.json.apple-credentials.key`。迁移或回退时必须同时备份状态文件和该密钥文件。程序以 `0600` 权限保存状态与密钥文件；`config.json` 中写入 Key 后也建议执行：

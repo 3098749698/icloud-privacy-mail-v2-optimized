@@ -542,12 +542,24 @@ func watchICloudIMAPMailboxExists(ctx context.Context, state LoginState, watchFo
 	}
 	lastExists := imapExistsCount(selectLines)
 	lastUID := imapSelectLastUID(selectLines)
+	watchingJunk := strings.EqualFold(strings.TrimSpace(watchFolder), "junk")
+	lastJunkFingerprint := ""
+	if watchingJunk {
+		searchTag := nextTag()
+		lines, searchErr := imapCommand(conn, reader, searchTag, "UID SEARCH ALL")
+		if searchErr != nil {
+			return searchErr
+		}
+		lastJunkFingerprint = imapUIDFingerprint(lines, 16)
+		if currentUID := imapMaxUID(lines); currentUID > lastUID {
+			lastUID = currentUID
+		}
+	}
 	if onReady != nil {
 		onReady()
 	}
 
 	idleTimeout := imapIdleReadTimeout
-	watchingJunk := strings.EqualFold(strings.TrimSpace(watchFolder), "junk")
 	if watchingJunk {
 		idleTimeout = qqJunkIdleProbe
 	}
@@ -565,9 +577,12 @@ func watchICloudIMAPMailboxExists(ctx context.Context, state LoginState, watchFo
 						return searchErr
 					}
 					currentUID := imapMaxUID(lines)
-					if currentUID > lastUID && onExists != nil {
+					fingerprint := imapUIDFingerprint(lines, 16)
+					changed := currentUID > lastUID || (lastJunkFingerprint != "" && fingerprint != lastJunkFingerprint)
+					if changed && onExists != nil {
 						onExists()
 					}
+					lastJunkFingerprint = fingerprint
 					if currentUID > lastUID {
 						lastUID = currentUID
 					}
@@ -659,6 +674,20 @@ func imapMaxUID(lines []string) int {
 		}
 	}
 	return maxUID
+}
+
+func imapUIDFingerprint(lines []string, limit int) string {
+	uids := imapSearchUIDs(lines)
+	if len(uids) == 0 {
+		return ""
+	}
+	sortInts(uids)
+	uids = lastIntValues(uids, limit)
+	parts := make([]string, 0, len(uids))
+	for _, uid := range uids {
+		parts = append(parts, strconv.Itoa(uid))
+	}
+	return strings.Join(parts, ",")
 }
 
 func imapReadUntilTag(reader *bufio.Reader, tag string) ([]string, error) {
@@ -1023,7 +1052,7 @@ func syncSelectedIMAPMailboxFiltered(conn net.Conn, reader *bufio.Reader, nextTa
 	fetched := make([]iCloudIMAPFetchedMessage, 0, len(uids))
 	for _, chunk := range chunkInts(uids, 20) {
 		fetchTag := nextTag()
-		lines, literals, fetchErr := imapCommandWithLiterals(conn, reader, fetchTag, "UID FETCH "+imapUIDSet(chunk)+" (UID BODY.PEEK[]<0.200000>)")
+		lines, literals, fetchErr := imapCommandWithLiterals(conn, reader, fetchTag, "UID FETCH "+imapUIDSet(chunk)+" (UID INTERNALDATE BODY.PEEK[]<0.200000>)")
 		if fetchErr != nil {
 			return nil, "", errCode("imap_fetch_failed", "读取 IMAP 邮件失败："+fetchErr.Error(), true)
 		}
@@ -1031,12 +1060,16 @@ func syncSelectedIMAPMailboxFiltered(conn net.Conn, reader *bufio.Reader, nextTa
 			return nil, "", errCode("imap_fetch_failed", "读取 IMAP 邮件失败："+imapResponseSummary(lines), true)
 		}
 		fetchUIDs := imapFetchUIDs(lines)
+		internalDates := imapFetchInternalDates(lines)
 		for i, raw := range literals {
 			uid := ""
+			var providerReceivedAt time.Time
 			if i < len(fetchUIDs) {
-				uid = strconv.Itoa(fetchUIDs[i])
+				uidNumber := fetchUIDs[i]
+				uid = strconv.Itoa(uidNumber)
+				providerReceivedAt = internalDates[uidNumber]
 			}
-			fetched = append(fetched, iCloudIMAPFetchedMessage{UID: uid, Folder: remoteFolder, Raw: raw})
+			fetched = append(fetched, iCloudIMAPFetchedMessage{UID: uid, Folder: remoteFolder, Raw: raw, ProviderReceivedAt: providerReceivedAt})
 		}
 	}
 	return fetched, lastUID, nil
@@ -1241,9 +1274,10 @@ func imapLineHasExistsEvent(line string) bool {
 }
 
 type iCloudIMAPFetchedMessage struct {
-	UID    string
-	Folder string
-	Raw    []byte
+	UID                string
+	Folder             string
+	Raw                []byte
+	ProviderReceivedAt time.Time
 }
 
 func iCloudIMAPMessagesByMailbox(fetched []iCloudIMAPFetchedMessage, mailboxes []Mailbox, after time.Time, keyword string, ignoredEmails ...string) map[string][]ICloudSyncedMessage {
@@ -1317,12 +1351,13 @@ func parseICloudIMAPMessage(item iCloudIMAPFetchedMessage) (ICloudSyncedMessage,
 	}
 	recipients := imapHeaderText(msg.Header)
 	return ICloudSyncedMessage{
-		RemoteID:   remoteID,
-		UID:        uid,
-		Subject:    subject,
-		From:       from,
-		Body:       normalizeMailBody(subject + "\n" + body),
-		ReceivedAt: receivedAt,
+		RemoteID:           remoteID,
+		UID:                uid,
+		Subject:            subject,
+		From:               from,
+		Body:               normalizeMailBody(subject + "\n" + body),
+		ReceivedAt:         receivedAt,
+		ProviderReceivedAt: item.ProviderReceivedAt,
 	}, recipients, true
 }
 
@@ -1408,6 +1443,32 @@ func imapFetchUIDs(lines []string) []int {
 					out = append(out, n)
 				}
 			}
+		}
+	}
+	return out
+}
+
+func imapFetchInternalDates(lines []string) map[int]time.Time {
+	out := make(map[int]time.Time)
+	for _, line := range lines {
+		uids := imapFetchUIDs([]string{line})
+		if len(uids) == 0 {
+			continue
+		}
+		upper := strings.ToUpper(line)
+		const marker = `INTERNALDATE "`
+		start := strings.Index(upper, marker)
+		if start < 0 {
+			continue
+		}
+		value := line[start+len(marker):]
+		end := strings.Index(value, `"`)
+		if end < 0 {
+			continue
+		}
+		parsed, err := time.Parse("2-Jan-2006 15:04:05 -0700", value[:end])
+		if err == nil {
+			out[uids[0]] = parsed
 		}
 	}
 	return out

@@ -186,16 +186,17 @@ type MailboxLease struct {
 }
 
 type Message struct {
-	ID         string    `json:"id"`
-	OwnerID    string    `json:"owner_id,omitempty"`
-	MailboxID  string    `json:"mailbox_id"`
-	RemoteID   string    `json:"remote_id,omitempty"`
-	Source     string    `json:"source,omitempty"`
-	Subject    string    `json:"subject"`
-	From       string    `json:"from"`
-	Body       string    `json:"body"`
-	ReceivedAt time.Time `json:"received_at"`
-	CreatedAt  time.Time `json:"created_at"`
+	ID                 string     `json:"id"`
+	OwnerID            string     `json:"owner_id,omitempty"`
+	MailboxID          string     `json:"mailbox_id"`
+	RemoteID           string     `json:"remote_id,omitempty"`
+	Source             string     `json:"source,omitempty"`
+	Subject            string     `json:"subject"`
+	From               string     `json:"from"`
+	Body               string     `json:"body"`
+	ReceivedAt         time.Time  `json:"received_at"`
+	ProviderReceivedAt *time.Time `json:"provider_received_at,omitempty"`
+	CreatedAt          time.Time  `json:"created_at"`
 }
 
 type RemoteMailbox struct {

@@ -226,6 +226,44 @@ func (s *Service) Wake(mailboxID string) {
 	}
 }
 
+// Observe marks a mailbox as latency-sensitive without forcing a network scan.
+// Existing IDLE workers already watch the owning account; the active marker only
+// moves this alias to the front of recipient matching and fallback work.
+func (s *Service) Observe(mailboxID string) {
+	mailboxID = strings.TrimSpace(mailboxID)
+	if mailboxID == "" {
+		return
+	}
+	s.activeMu.Lock()
+	s.activeUntil[mailboxID] = time.Now().Add(mailWatcherActiveTTL)
+	s.activeMu.Unlock()
+}
+
+func (s *Service) MailboxIdleReady(mailboxID string) bool {
+	mailbox, ok := s.store.FindMailboxByID(strings.TrimSpace(mailboxID))
+	if !ok {
+		return false
+	}
+	session, ok := s.store.ICloudSessionByAccountID(mailbox.AccountID)
+	if !ok {
+		return false
+	}
+	state, ok := protocol.LoginStateForKind(session, domain.LoginStateICloudIMAP)
+	if !ok || !imapStateConfigured(state) {
+		return false
+	}
+	key := firstNonEmpty(session.AccountID, mailbox.AccountID, mailbox.OwnerID, "__imap__")
+	s.statusMu.RLock()
+	defer s.statusMu.RUnlock()
+	if !s.status.Running || !s.status.Enabled || !s.readyWorkers[key] {
+		return false
+	}
+	if strings.EqualFold(strings.TrimSuffix(strings.TrimSpace(state.IMAPHost), "."), "imap.qq.com") && !s.readyWorkers[key+"#junk"] {
+		return false
+	}
+	return true
+}
+
 func (s *Service) consumeWake() (bool, map[string]struct{}) {
 	s.wakeMu.Lock()
 	defer s.wakeMu.Unlock()
@@ -309,7 +347,7 @@ func (s *Service) syncRound(ctx context.Context, groups []watchGroup, initial bo
 			continue
 		}
 		syncCtx, cancel := context.WithTimeout(ctx, mailWatcherSyncTimeout)
-		count, err := s.mailbox.SyncMailboxBatch(syncCtx, group.mailboxes, after, "OpenAI", limit)
+		count, err := s.mailbox.SyncMailboxBatchScheduled(syncCtx, group.mailboxes, after, "OpenAI", limit)
 		cancel()
 		total += count
 		if err != nil && ctx.Err() == nil {
@@ -362,7 +400,8 @@ func idleWorkerTargets(group watchGroup) []idleWorkerTarget {
 
 func (s *Service) runIdleWorker(ctx context.Context, group watchGroup, target idleWorkerTarget, token uint64) {
 	workerCtx, cancelWorker := context.WithCancel(ctx)
-	syncRequests := make(chan struct{}, 1)
+	eventRequests := make(chan struct{}, 1)
+	reconnectRequests := make(chan struct{}, 1)
 	readySignals := make(chan struct{}, 1)
 	groupKey := group.key
 	appleID := group.session.AppleID
@@ -370,14 +409,14 @@ func (s *Service) runIdleWorker(ctx context.Context, group watchGroup, target id
 	syncWorker.Add(2)
 	go func() {
 		defer syncWorker.Done()
-		runCoalescedSyncLoop(workerCtx, syncRequests, func(syncCtx context.Context) {
-			s.syncIdleGroupFolder(syncCtx, groupKey, appleID, target.folder)
+		runPrioritySyncLoop(workerCtx, eventRequests, reconnectRequests, func(syncCtx context.Context, priority mailboxservice.SyncPriority) {
+			s.syncIdleGroupFolder(syncCtx, groupKey, appleID, target.folder, priority)
 		})
 	}()
 	go func() {
 		defer syncWorker.Done()
 		runIdleReadySyncLoop(workerCtx, readySignals, mailWatcherReadySyncWindow, func() {
-			requestIdleSync(syncRequests)
+			requestIdleSync(reconnectRequests)
 		})
 	}()
 	defer func() {
@@ -454,7 +493,7 @@ func (s *Service) runIdleWorker(ctx context.Context, group watchGroup, target id
 			// Return immediately so the IMAP connection re-enters IDLE while the
 			// per-worker sync loop fetches mail on its own connection. A buffered
 			// request preserves one trailing sync when EXISTS arrives mid-sync.
-			requestIdleSync(syncRequests)
+			requestIdleSync(eventRequests)
 		})
 		s.markWorkerReady(target.key, token, false)
 		if workerCtx.Err() != nil {
@@ -479,6 +518,30 @@ func (s *Service) runIdleWorker(ctx context.Context, group watchGroup, target id
 			if backoff > mailWatcherIdleMaxBackoff {
 				backoff = mailWatcherIdleMaxBackoff
 			}
+		}
+	}
+}
+
+func runPrioritySyncLoop(ctx context.Context, eventRequests, reconnectRequests <-chan struct{}, syncFn func(context.Context, mailboxservice.SyncPriority)) {
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		default:
+		}
+		select {
+		case <-eventRequests:
+			syncFn(ctx, mailboxservice.SyncPriorityEvent)
+			continue
+		default:
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-eventRequests:
+			syncFn(ctx, mailboxservice.SyncPriorityEvent)
+		case <-reconnectRequests:
+			syncFn(ctx, mailboxservice.SyncPriorityReconnect)
 		}
 	}
 }
@@ -592,10 +655,10 @@ func requestIdleSync(requests chan<- struct{}) {
 }
 
 func (s *Service) syncIdleGroup(ctx context.Context, groupKey, appleID string) {
-	s.syncIdleGroupFolder(ctx, groupKey, appleID, "")
+	s.syncIdleGroupFolder(ctx, groupKey, appleID, "", mailboxservice.SyncPriorityEvent)
 }
 
-func (s *Service) syncIdleGroupFolder(ctx context.Context, groupKey, appleID string, folder idleFolder) {
+func (s *Service) syncIdleGroupFolder(ctx context.Context, groupKey, appleID string, folder idleFolder, priority mailboxservice.SyncPriority) {
 	currentGroup, ok := s.groupByKey(groupKey)
 	if !ok || ctx.Err() != nil {
 		return
@@ -604,9 +667,17 @@ func (s *Service) syncIdleGroupFolder(ctx context.Context, groupKey, appleID str
 	var count int
 	var syncErr error
 	if folder == "" {
-		count, syncErr = s.mailbox.SyncMailboxBatchFresh(syncCtx, currentGroup.mailboxes, time.Time{}, "OpenAI", mailWatcherIdleFetchLimit(s.cfg.MailWatcherFetchLimit))
+		if priority == mailboxservice.SyncPriorityEvent {
+			count, syncErr = s.mailbox.SyncMailboxBatchFresh(syncCtx, currentGroup.mailboxes, time.Time{}, "OpenAI", mailWatcherIdleFetchLimit(s.cfg.MailWatcherFetchLimit))
+		} else {
+			count, syncErr = s.mailbox.SyncMailboxBatchScheduled(syncCtx, currentGroup.mailboxes, time.Time{}, "OpenAI", mailWatcherIdleFetchLimit(s.cfg.MailWatcherFetchLimit))
+		}
 	} else {
-		count, syncErr = s.mailbox.SyncMailboxBatchFolderFresh(syncCtx, currentGroup.mailboxes, time.Time{}, "OpenAI", mailWatcherIdleFetchLimit(s.cfg.MailWatcherFetchLimit), string(folder))
+		if priority == mailboxservice.SyncPriorityEvent {
+			count, syncErr = s.mailbox.SyncMailboxBatchFolderFresh(syncCtx, currentGroup.mailboxes, time.Time{}, "OpenAI", mailWatcherIdleFetchLimit(s.cfg.MailWatcherFetchLimit), string(folder))
+		} else {
+			count, syncErr = s.mailbox.SyncMailboxBatchFolderReconnect(syncCtx, currentGroup.mailboxes, time.Time{}, "OpenAI", mailWatcherIdleFetchLimit(s.cfg.MailWatcherFetchLimit), string(folder))
+		}
 	}
 	cancel()
 	if syncErr != nil && ctx.Err() != nil {

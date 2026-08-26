@@ -14,6 +14,9 @@ type codeDiagnostics struct {
 	startedAt     time.Time
 	syncStartedAt time.Time
 	syncElapsed   time.Duration
+	idleReady     bool
+	fetchMode     string
+	queueWait     time.Duration
 }
 
 func newCodeDiagnostics() codeDiagnostics {
@@ -44,6 +47,9 @@ func (d codeDiagnostics) meta(source string, lastSyncAt time.Time) map[string]an
 		"source":          source,
 		"elapsed_ms":      elapsedMilliseconds(time.Since(d.startedAt)),
 		"sync_elapsed_ms": elapsedMilliseconds(d.syncElapsed),
+		"queue_wait_ms":   elapsedMilliseconds(d.queueWait),
+		"idle_ready":      d.idleReady,
+		"fetch_mode":      d.fetchMode,
 		"last_sync_at":    nil,
 	}
 	if !lastSyncAt.IsZero() {
@@ -64,11 +70,25 @@ func writeCodeSuccess(w http.ResponseWriter, status int, data any, meta map[stri
 }
 
 func (s *Server) writeObservedCodeSuccess(w http.ResponseWriter, result mailboxservice.CodeResult, diagnostics codeDiagnostics, source string, lastSyncAt time.Time) {
+	returnedAt := time.Now()
+	result.APIReturnedAt = returnedAt
 	meta := diagnostics.meta(source, lastSyncAt)
+	providerToDetect := time.Duration(0)
+	if result.ProviderReceivedAt != nil && !result.ProviderReceivedAt.IsZero() && !result.DetectedAt.IsZero() {
+		providerToDetect = result.DetectedAt.Sub(*result.ProviderReceivedAt)
+	}
+	detectToResponse := time.Duration(0)
+	if !result.DetectedAt.IsZero() {
+		detectToResponse = returnedAt.Sub(result.DetectedAt)
+	}
+	meta["folder"] = result.Folder
+	meta["provider_to_detect_ms"] = elapsedMilliseconds(providerToDetect)
+	meta["detect_to_response_ms"] = elapsedMilliseconds(detectToResponse)
 	s.log.Info("验证码取码时间线",
 		"邮箱", result.Email,
 		"目录", result.Folder,
-		"邮件到达", result.ReceivedAt,
+		"邮件日期", result.MessageDateAt,
+		"服务商入箱", result.ProviderReceivedAt,
 		"程序读到", result.DetectedAt,
 		"读取延迟_ms", result.DeliveryDelayMS,
 		"接口来源", source,

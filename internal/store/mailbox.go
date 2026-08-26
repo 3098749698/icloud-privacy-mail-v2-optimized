@@ -814,7 +814,7 @@ func (s *Store) ApplyMailboxSync(updates []MailboxSyncUpdate, roundTimes ...time
 				ID: s.nextIDLocked("msg"), OwnerID: mailbox.OwnerID, MailboxID: mailbox.ID,
 				RemoteID: remoteID, Source: strings.TrimSpace(incoming.Source),
 				Subject: strings.TrimSpace(incoming.Subject), From: strings.TrimSpace(incoming.From),
-				Body: incoming.Body, ReceivedAt: receivedAt, CreatedAt: now,
+				Body: incoming.Body, ReceivedAt: receivedAt, ProviderReceivedAt: incoming.ProviderReceivedAt, CreatedAt: now,
 			})
 			mailbox.ReceiveCount++
 			created++

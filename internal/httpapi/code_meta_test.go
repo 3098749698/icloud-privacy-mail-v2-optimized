@@ -9,6 +9,7 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"path/filepath"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -250,20 +251,19 @@ func TestPublicCodeKeepsPollingCacheAfterDirectSyncFailure(t *testing.T) {
 	}
 }
 
-func TestPublicCodeWaitTriggersAnotherFreshSyncForLateMessage(t *testing.T) {
+func TestPublicCodeWaitUsesNotificationWithoutRepeatedSync(t *testing.T) {
 	server, state, mailbox := newCodeDiagnosticsFixture(t)
-	server.codeResyncInterval = 25 * time.Millisecond
+	changes := make(chan struct{})
+	server.codeChanges = func(string) <-chan struct{} { return changes }
 	var calls atomic.Int32
 	server.syncMailboxFresh = func(_ context.Context, mailboxID string) (int, error) {
-		if call := calls.Add(1); call == 2 {
-			_, _, err := state.UpsertMessage(mailboxID, "imap:junk:late-404", "imap", "OpenAI verification code 556677", "noreply@openai.com", "Your code is 556677", time.Now())
-			if err != nil {
-				return 0, err
-			}
-			return 1, nil
-		}
+		calls.Add(1)
 		return 0, nil
 	}
+	time.AfterFunc(50*time.Millisecond, func() {
+		_, _, _ = state.UpsertMessage(mailbox.ID, "imap:junk:late-404", "imap", "OpenAI verification code 556677", "noreply@openai.com", "Your code is 556677", time.Now())
+		close(changes)
+	})
 
 	requestURL := "/api/v1/mailboxes/" + url.PathEscape(mailbox.Email) + "/code?key=" + url.QueryEscape(mailbox.APIToken) + "&wait_ms=500&preview=1"
 	recorder := httptest.NewRecorder()
@@ -271,10 +271,128 @@ func TestPublicCodeWaitTriggersAnotherFreshSyncForLateMessage(t *testing.T) {
 	response := decodeCodeResponse(t, recorder)
 	data, ok := response["data"].(map[string]any)
 	if recorder.Code != http.StatusOK || !ok || data["code"] != "556677" || data["folder"] != "junk" {
-		t.Fatalf("等待期间第二轮同步未返回晚到验证码：status=%d calls=%d body=%v", recorder.Code, calls.Load(), response)
+		t.Fatalf("通知唤醒未返回晚到验证码：status=%d calls=%d body=%v", recorder.Code, calls.Load(), response)
 	}
-	if calls.Load() < 2 {
-		t.Fatalf("等待期间只触发了 %d 轮同步", calls.Load())
+	if calls.Load() != 1 {
+		t.Fatalf("等待期间触发了 %d 轮同步，期望共享兜底仅一轮", calls.Load())
+	}
+}
+
+func TestTenIdleReadyWaitersUseNotificationWithoutIMAPScans(t *testing.T) {
+	server, state, mailbox := newCodeDiagnosticsFixture(t)
+	server.mailboxIdleReady = func(string) bool { return true }
+	changes := make(chan struct{})
+	server.codeChanges = func(string) <-chan struct{} { return changes }
+	var scans atomic.Int32
+	server.syncMailboxFresh = func(context.Context, string) (int, error) {
+		scans.Add(1)
+		return 0, nil
+	}
+
+	requestURL := "/api/v1/mailboxes/" + url.PathEscape(mailbox.Email) + "/code?key=" + url.QueryEscape(mailbox.APIToken) + "&wait_ms=1000&preview=1"
+	const waiters = 10
+	responses := make(chan *httptest.ResponseRecorder, waiters)
+	var wg sync.WaitGroup
+	for range waiters {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			recorder := httptest.NewRecorder()
+			server.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, requestURL, nil))
+			responses <- recorder
+		}()
+	}
+	time.Sleep(40 * time.Millisecond)
+	providerAt := time.Now().Add(-2 * time.Second)
+	_, err := state.ApplyMailboxSync([]store.MailboxSyncUpdate{{
+		MailboxID: mailbox.ID,
+		Messages: []domain.Message{{
+			RemoteID: "imap:junk:notify-10", Source: "imap", Subject: "OpenAI verification code 667788",
+			From: "noreply@openai.com", Body: "Your code is 667788", ReceivedAt: providerAt.Add(-time.Second), ProviderReceivedAt: &providerAt,
+		}},
+		SyncedAt: time.Now(),
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	close(changes)
+	wg.Wait()
+	close(responses)
+	if scans.Load() != 0 {
+		t.Fatalf("IDLE ready waiters triggered %d IMAP scans", scans.Load())
+	}
+	for recorder := range responses {
+		response := decodeCodeResponse(t, recorder)
+		data, ok := response["data"].(map[string]any)
+		if recorder.Code != http.StatusOK || !ok || data["code"] != "667788" {
+			t.Fatalf("notification response status=%d body=%v", recorder.Code, response)
+		}
+		if data["provider_received_at"] == nil || data["api_returned_at"] == nil {
+			t.Fatalf("timeline fields missing: %v", data)
+		}
+		meta, _ := response["meta"].(map[string]any)
+		if meta["idle_ready"] != true || meta["fetch_mode"] != "idle-targeted" {
+			t.Fatalf("idle metadata mismatch: %v", meta)
+		}
+	}
+}
+
+func TestTenIdleUnreadyWaitersShareOneFallbackScan(t *testing.T) {
+	server, state, mailbox := newCodeDiagnosticsFixture(t)
+	server.mailboxIdleReady = func(string) bool { return false }
+	changes := make(chan struct{})
+	server.codeChanges = func(string) <-chan struct{} { return changes }
+	var scans atomic.Int32
+	scanStarted := make(chan struct{})
+	releaseScan := make(chan struct{})
+	server.syncMailboxFresh = func(context.Context, string) (int, error) {
+		if scans.Add(1) == 1 {
+			close(scanStarted)
+		}
+		<-releaseScan
+		return 0, nil
+	}
+
+	requestURL := "/api/v1/mailboxes/" + url.PathEscape(mailbox.Email) + "/code?key=" + url.QueryEscape(mailbox.APIToken) + "&wait_ms=1000&preview=1"
+	const waiters = 10
+	responses := make(chan *httptest.ResponseRecorder, waiters)
+	var wg sync.WaitGroup
+	for range waiters {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			recorder := httptest.NewRecorder()
+			server.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, requestURL, nil))
+			responses <- recorder
+		}()
+	}
+	<-scanStarted
+	time.Sleep(40 * time.Millisecond)
+	providerAt := time.Now().Add(-time.Second)
+	_, err := state.ApplyMailboxSync([]store.MailboxSyncUpdate{{
+		MailboxID: mailbox.ID,
+		Messages: []domain.Message{{
+			RemoteID: "imap:inbox:shared-fallback", Source: "imap", Subject: "OpenAI verification code 778899",
+			From: "noreply@openai.com", Body: "Your code is 778899", ReceivedAt: providerAt, ProviderReceivedAt: &providerAt,
+		}},
+		SyncedAt: time.Now(),
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	close(changes)
+	close(releaseScan)
+	wg.Wait()
+	close(responses)
+	if scans.Load() != 1 {
+		t.Fatalf("10 waiters started %d fallback scans, want 1", scans.Load())
+	}
+	for recorder := range responses {
+		response := decodeCodeResponse(t, recorder)
+		data, ok := response["data"].(map[string]any)
+		if recorder.Code != http.StatusOK || !ok || data["code"] != "778899" {
+			t.Fatalf("shared fallback response status=%d body=%v", recorder.Code, response)
+		}
 	}
 }
 

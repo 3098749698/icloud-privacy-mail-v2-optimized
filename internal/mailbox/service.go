@@ -29,6 +29,8 @@ type Service struct {
 	createMu           sync.Mutex
 	syncMu             sync.Mutex
 	syncs              map[string]*syncCall
+	codeNotifyMu       sync.Mutex
+	codeNotify         map[string]chan struct{}
 }
 
 type syncGroupRunner func(context.Context, []domain.Mailbox, time.Time, string, int) (int, error)
@@ -59,20 +61,34 @@ type syncCall struct {
 	done      chan struct{}
 	startedAt time.Time
 	folder    string
+	priority  SyncPriority
+	cancel    context.CancelFunc
 	count     int
 	err       error
 }
 
+type SyncPriority int
+
+const (
+	SyncPriorityManual SyncPriority = iota + 1
+	SyncPriorityScheduled
+	SyncPriorityReconnect
+	SyncPriorityEvent
+)
+
 type CodeResult struct {
-	Email           string    `json:"email"`
-	Code            string    `json:"code"`
-	Subject         string    `json:"subject"`
-	From            string    `json:"from"`
-	ReceivedAt      time.Time `json:"received_at"`
-	DetectedAt      time.Time `json:"detected_at"`
-	DeliveryDelayMS int64     `json:"delivery_delay_ms"`
-	MessageID       string    `json:"message_id"`
-	Folder          string    `json:"folder"`
+	Email              string     `json:"email"`
+	Code               string     `json:"code"`
+	Subject            string     `json:"subject"`
+	From               string     `json:"from"`
+	ReceivedAt         time.Time  `json:"received_at"`
+	MessageDateAt      time.Time  `json:"message_date_at,omitempty"`
+	ProviderReceivedAt *time.Time `json:"provider_received_at,omitempty"`
+	DetectedAt         time.Time  `json:"detected_at"`
+	APIReturnedAt      time.Time  `json:"api_returned_at,omitempty"`
+	DeliveryDelayMS    int64      `json:"delivery_delay_ms"`
+	MessageID          string     `json:"message_id"`
+	Folder             string     `json:"folder"`
 }
 
 type CodeQuery struct {
@@ -626,19 +642,31 @@ func (s *Service) syncMessages(ctx context.Context, mailboxID string, requireFre
 
 // SyncMailboxBatch 按 Apple 账号批量拉取一次收件箱，再把邮件分发给对应隐私邮箱。
 func (s *Service) SyncMailboxBatch(ctx context.Context, mailboxes []domain.Mailbox, after time.Time, keyword string, maxMessages int) (int, error) {
-	return s.syncMailboxBatch(ctx, mailboxes, after, keyword, maxMessages, false)
+	return s.syncMailboxBatch(ctx, mailboxes, after, keyword, maxMessages, false, SyncPriorityManual)
+}
+
+func (s *Service) SyncMailboxBatchScheduled(ctx context.Context, mailboxes []domain.Mailbox, after time.Time, keyword string, maxMessages int) (int, error) {
+	return s.syncMailboxBatch(ctx, mailboxes, after, keyword, maxMessages, false, SyncPriorityScheduled)
 }
 
 // SyncMailboxBatchFresh guarantees that every account gets a round that starts
 // after this call begins. An older shared round is allowed to finish, but its
 // result is not reused as the requested refresh.
 func (s *Service) SyncMailboxBatchFresh(ctx context.Context, mailboxes []domain.Mailbox, after time.Time, keyword string, maxMessages int) (int, error) {
-	return s.syncMailboxBatch(ctx, mailboxes, after, keyword, maxMessages, true)
+	return s.syncMailboxBatch(ctx, mailboxes, after, keyword, maxMessages, true, SyncPriorityManual)
 }
 
 // SyncMailboxBatchFolderFresh performs a new IMAP scan of only the folder that
 // produced an IDLE event. Scheduled fallbacks continue to use the full scan.
 func (s *Service) SyncMailboxBatchFolderFresh(ctx context.Context, mailboxes []domain.Mailbox, after time.Time, keyword string, maxMessages int, folder string) (int, error) {
+	return s.syncMailboxBatchFolderFreshPriority(ctx, mailboxes, after, keyword, maxMessages, folder, SyncPriorityEvent)
+}
+
+func (s *Service) SyncMailboxBatchFolderReconnect(ctx context.Context, mailboxes []domain.Mailbox, after time.Time, keyword string, maxMessages int, folder string) (int, error) {
+	return s.syncMailboxBatchFolderFreshPriority(ctx, mailboxes, after, keyword, maxMessages, folder, SyncPriorityReconnect)
+}
+
+func (s *Service) syncMailboxBatchFolderFreshPriority(ctx context.Context, mailboxes []domain.Mailbox, after time.Time, keyword string, maxMessages int, folder string, priority SyncPriority) (int, error) {
 	if len(mailboxes) == 0 {
 		return 0, nil
 	}
@@ -656,7 +684,7 @@ func (s *Service) SyncMailboxBatchFolderFresh(ctx context.Context, mailboxes []d
 	}
 	total := 0
 	for _, key := range order {
-		count, err := s.syncGroupFolderFresh(ctx, key, groups[key], after, keyword, maxMessages, folder, time.Now())
+		count, err := s.syncGroupFolderPriority(ctx, key, groups[key], after, keyword, maxMessages, folder, time.Now(), priority)
 		total += count
 		if err != nil {
 			return total, err
@@ -665,7 +693,7 @@ func (s *Service) SyncMailboxBatchFolderFresh(ctx context.Context, mailboxes []d
 	return total, nil
 }
 
-func (s *Service) syncMailboxBatch(ctx context.Context, mailboxes []domain.Mailbox, after time.Time, keyword string, maxMessages int, requireFresh bool) (int, error) {
+func (s *Service) syncMailboxBatch(ctx context.Context, mailboxes []domain.Mailbox, after time.Time, keyword string, maxMessages int, requireFresh bool, priority SyncPriority) (int, error) {
 	if len(mailboxes) == 0 {
 		return 0, nil
 	}
@@ -690,9 +718,9 @@ func (s *Service) syncMailboxBatch(ctx context.Context, mailboxes []domain.Mailb
 		var count int
 		var err error
 		if requireFresh {
-			count, err = s.syncGroupFresh(ctx, key, groups[key], after, keyword, maxMessages, freshAfter)
+			count, err = s.syncGroupPriority(ctx, key, groups[key], after, keyword, maxMessages, freshAfter, priority)
 		} else {
-			count, err = s.syncGroup(ctx, key, groups[key], after, keyword, maxMessages)
+			count, err = s.syncGroupPriority(ctx, key, groups[key], after, keyword, maxMessages, time.Time{}, priority)
 		}
 		total += count
 		if err != nil {
@@ -703,14 +731,18 @@ func (s *Service) syncMailboxBatch(ctx context.Context, mailboxes []domain.Mailb
 }
 
 func (s *Service) syncGroup(ctx context.Context, key string, mailboxes []domain.Mailbox, after time.Time, keyword string, maxMessages int) (int, error) {
-	return s.syncGroupFolder(ctx, key, mailboxes, after, keyword, maxMessages, protocol.IMAPSyncFolderAll, time.Time{})
+	return s.syncGroupPriority(ctx, key, mailboxes, after, keyword, maxMessages, time.Time{}, SyncPriorityManual)
 }
 
 func (s *Service) syncGroupFolderFresh(ctx context.Context, key string, mailboxes []domain.Mailbox, after time.Time, keyword string, maxMessages int, folder string, freshAfter time.Time) (int, error) {
-	return s.syncGroupFolder(ctx, key, mailboxes, after, keyword, maxMessages, folder, freshAfter)
+	return s.syncGroupFolderPriority(ctx, key, mailboxes, after, keyword, maxMessages, folder, freshAfter, SyncPriorityEvent)
 }
 
-func (s *Service) syncGroupFolder(ctx context.Context, key string, mailboxes []domain.Mailbox, after time.Time, keyword string, maxMessages int, folder string, freshAfter time.Time) (int, error) {
+func (s *Service) syncGroupPriority(ctx context.Context, key string, mailboxes []domain.Mailbox, after time.Time, keyword string, maxMessages int, freshAfter time.Time, priority SyncPriority) (int, error) {
+	return s.syncGroupFolderPriority(ctx, key, mailboxes, after, keyword, maxMessages, protocol.IMAPSyncFolderAll, freshAfter, priority)
+}
+
+func (s *Service) syncGroupFolderPriority(ctx context.Context, key string, mailboxes []domain.Mailbox, after time.Time, keyword string, maxMessages int, folder string, freshAfter time.Time, priority SyncPriority) (int, error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -722,6 +754,10 @@ func (s *Service) syncGroupFolder(ctx context.Context, key string, mailboxes []d
 		s.syncMu.Lock()
 		if running := s.syncs[key]; running != nil {
 			canJoin := syncFolderCovers(running.folder, folder) && (freshAfter.IsZero() || !running.startedAt.Before(freshAfter))
+			if priority > running.priority && running.cancel != nil {
+				running.cancel()
+				canJoin = false
+			}
 			s.syncMu.Unlock()
 			count, err := waitSyncCall(ctx, running)
 			if canJoin || ctx.Err() != nil {
@@ -732,7 +768,8 @@ func (s *Service) syncGroupFolder(ctx context.Context, key string, mailboxes []d
 			// round; other waiters will join the winner.
 			continue
 		}
-		call := &syncCall{done: make(chan struct{}), startedAt: time.Now(), folder: folder}
+		sharedCtx, cancel := context.WithTimeout(context.Background(), mailboxSyncSharedTimeout)
+		call := &syncCall{done: make(chan struct{}), startedAt: time.Now(), folder: folder, priority: priority, cancel: cancel}
 		s.syncs[key] = call
 		s.syncMu.Unlock()
 
@@ -740,7 +777,6 @@ func (s *Service) syncGroupFolder(ctx context.Context, key string, mailboxes []d
 		// deadline. All callers for this account share this one round.
 		mailboxesCopy := append([]domain.Mailbox(nil), mailboxes...)
 		go func() {
-			sharedCtx, cancel := context.WithTimeout(context.Background(), mailboxSyncSharedTimeout)
 			defer cancel()
 			var count int
 			var err error
@@ -763,7 +799,7 @@ func (s *Service) syncGroupFolder(ctx context.Context, key string, mailboxes []d
 }
 
 func (s *Service) syncGroupFresh(ctx context.Context, key string, mailboxes []domain.Mailbox, after time.Time, keyword string, maxMessages int, freshAfter time.Time) (int, error) {
-	return s.syncGroupFolder(ctx, key, mailboxes, after, keyword, maxMessages, protocol.IMAPSyncFolderAll, freshAfter)
+	return s.syncGroupPriority(ctx, key, mailboxes, after, keyword, maxMessages, freshAfter, SyncPriorityManual)
 }
 
 func normalizeSyncFolder(folder string) string {
@@ -890,14 +926,60 @@ func (s *Service) applyMailboxSync(refreshed []domain.Mailbox, messagesByMailbox
 		update := store.MailboxSyncUpdate{MailboxID: mailbox.ID, LastSyncUID: mailboxUID, SyncedAt: syncedAt, SkipIfUnchanged: source == "imap"}
 		for _, message := range messagesByMailbox[mailbox.ID] {
 			remoteID := firstNonEmpty(message.RemoteID, message.UID)
+			var providerReceivedAt *time.Time
+			if !message.ProviderReceivedAt.IsZero() {
+				value := message.ProviderReceivedAt
+				providerReceivedAt = &value
+			}
 			update.Messages = append(update.Messages, domain.Message{
 				RemoteID: remoteID, Source: source, Subject: message.Subject,
-				From: message.From, Body: message.Body, ReceivedAt: message.ReceivedAt,
+				From: message.From, Body: message.Body, ReceivedAt: message.ReceivedAt, ProviderReceivedAt: providerReceivedAt,
 			})
 		}
 		updates = append(updates, update)
 	}
-	return s.store.ApplyMailboxSync(updates)
+	created, err := s.store.ApplyMailboxSync(updates)
+	if err != nil || created == 0 {
+		return created, err
+	}
+	for mailboxID, messages := range messagesByMailbox {
+		if len(messages) > 0 {
+			s.notifyCodeChange(mailboxID)
+		}
+	}
+	return created, nil
+}
+
+// CodeChanges returns the current generation channel for a mailbox. Writers
+// close and replace it after durable message persistence, so waiters need no
+// per-request registration or cleanup.
+func (s *Service) CodeChanges(mailboxID string) <-chan struct{} {
+	mailboxID = strings.TrimSpace(mailboxID)
+	s.codeNotifyMu.Lock()
+	defer s.codeNotifyMu.Unlock()
+	if s.codeNotify == nil {
+		s.codeNotify = make(map[string]chan struct{})
+	}
+	if s.codeNotify[mailboxID] == nil {
+		s.codeNotify[mailboxID] = make(chan struct{})
+	}
+	return s.codeNotify[mailboxID]
+}
+
+func (s *Service) notifyCodeChange(mailboxID string) {
+	mailboxID = strings.TrimSpace(mailboxID)
+	if mailboxID == "" {
+		return
+	}
+	s.codeNotifyMu.Lock()
+	defer s.codeNotifyMu.Unlock()
+	if s.codeNotify == nil {
+		s.codeNotify = make(map[string]chan struct{})
+	}
+	if current := s.codeNotify[mailboxID]; current != nil {
+		close(current)
+	}
+	s.codeNotify[mailboxID] = make(chan struct{})
 }
 
 // updatePreparedIMAPState performs a compare-and-apply update for the
@@ -1054,13 +1136,19 @@ func (s *Service) findCode(mailbox domain.Mailbox, query CodeQuery) (CodeResult,
 		if detectedAt.IsZero() {
 			detectedAt = messageTime
 		}
-		deliveryDelay := detectedAt.Sub(messageTime)
+		providerReceivedAt := message.ProviderReceivedAt
+		deliveryStart := messageTime
+		if providerReceivedAt != nil && !providerReceivedAt.IsZero() {
+			deliveryStart = *providerReceivedAt
+		}
+		deliveryDelay := detectedAt.Sub(deliveryStart)
 		if deliveryDelay < 0 {
 			deliveryDelay = 0
 		}
 		return CodeResult{
 			Email: mailbox.Email, Code: code, Subject: message.Subject, From: message.From,
-			ReceivedAt: messageTime, DetectedAt: detectedAt, DeliveryDelayMS: deliveryDelay.Milliseconds(),
+			ReceivedAt: messageTime, MessageDateAt: messageTime, ProviderReceivedAt: providerReceivedAt,
+			DetectedAt: detectedAt, DeliveryDelayMS: deliveryDelay.Milliseconds(),
 			MessageID: message.ID, Folder: codeMessageFolder(message),
 		}, true, nil
 	}

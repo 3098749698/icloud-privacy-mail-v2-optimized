@@ -3,6 +3,7 @@ package mailbox
 import (
 	"context"
 	"errors"
+	"fmt"
 	"path/filepath"
 	"sync"
 	"testing"
@@ -226,6 +227,87 @@ func TestAccountCoordinatorSerializesDifferentFolders(t *testing.T) {
 	defer mu.Unlock()
 	if maxActive != 1 {
 		t.Fatalf("max active account syncs=%d, want 1", maxActive)
+	}
+}
+
+func TestEventSyncPreemptsScheduledFallback(t *testing.T) {
+	started := make(chan string, 2)
+	service := &Service{syncs: make(map[string]*syncCall)}
+	service.syncFolderRunner = func(ctx context.Context, _ []domain.Mailbox, _ time.Time, _ string, _ int, folder string) (int, error) {
+		started <- folder
+		if folder == protocol.IMAPSyncFolderAll {
+			<-ctx.Done()
+			return 0, ctx.Err()
+		}
+		return 1, nil
+	}
+	mailboxes := []domain.Mailbox{{AccountID: "fixture"}}
+	lowDone := make(chan error, 1)
+	go func() {
+		_, err := service.SyncMailboxBatchScheduled(context.Background(), mailboxes, time.Time{}, "OpenAI", 8)
+		lowDone <- err
+	}()
+	if folder := <-started; folder != protocol.IMAPSyncFolderAll {
+		t.Fatalf("scheduled folder=%q", folder)
+	}
+	highDone := make(chan error, 1)
+	go func() {
+		_, err := service.SyncMailboxBatchFolderFresh(context.Background(), mailboxes, time.Time{}, "OpenAI", 8, protocol.IMAPSyncFolderJunk)
+		highDone <- err
+	}()
+	select {
+	case folder := <-started:
+		if folder != protocol.IMAPSyncFolderJunk {
+			t.Fatalf("event folder=%q", folder)
+		}
+	case err := <-highDone:
+		t.Fatalf("event sync returned before starting: %v", err)
+	case <-time.After(time.Second):
+		service.syncMu.Lock()
+		running := service.syncs["fixture"]
+		keys := make([]string, 0, len(service.syncs))
+		for key := range service.syncs {
+			keys = append(keys, key)
+		}
+		detail := fmt.Sprintf("keys=%v", keys)
+		if running != nil {
+			detail += fmt.Sprintf(" folder=%q priority=%d cancelNil=%v", running.folder, running.priority, running.cancel == nil)
+		}
+		service.syncMu.Unlock()
+		t.Fatalf("event sync did not preempt scheduled fallback; running=%s", detail)
+	}
+	if err := <-highDone; err != nil {
+		t.Fatalf("event sync failed: %v", err)
+	}
+	if err := <-lowDone; !errors.Is(err, context.Canceled) {
+		t.Fatalf("scheduled fallback was not canceled: %v", err)
+	}
+}
+
+func TestCodeChangeGenerationWakesAllWaiters(t *testing.T) {
+	service := &Service{}
+	const waiters = 10
+	ready := make(chan struct{})
+	woken := make(chan struct{}, waiters)
+	for range waiters {
+		changes := service.CodeChanges("mailbox")
+		go func() {
+			<-ready
+			<-changes
+			woken <- struct{}{}
+		}()
+	}
+	close(ready)
+	service.notifyCodeChange("mailbox")
+	for range waiters {
+		select {
+		case <-woken:
+		case <-time.After(time.Second):
+			t.Fatal("not all mailbox waiters were notified")
+		}
+	}
+	if next := service.CodeChanges("mailbox"); next == nil {
+		t.Fatal("notification generation was not replaced")
 	}
 }
 

@@ -281,3 +281,29 @@ func TestJunkWindowKeepsNewestMessages(t *testing.T) {
 		t.Fatalf("latest Junk UIDs = %#v, want [4 5]", got)
 	}
 }
+
+func TestIMAPFetchInternalDates(t *testing.T) {
+	lines := []string{
+		`* 7 FETCH (UID 321 INTERNALDATE "26-Aug-2026 11:42:40 +0800" BODY[] {10}`,
+		`* 8 FETCH (UID 322 BODY[] {10}`,
+	}
+	dates := imapFetchInternalDates(lines)
+	want := time.Date(2026, 8, 26, 11, 42, 40, 0, time.FixedZone("+0800", 8*60*60))
+	if got := dates[321]; !got.Equal(want) {
+		t.Fatalf("INTERNALDATE=%s, want %s", got, want)
+	}
+	if _, exists := dates[322]; exists {
+		t.Fatal("missing INTERNALDATE should not create a zero-value entry")
+	}
+}
+
+func TestJunkUIDFingerprintDetectsSameMaxReclassification(t *testing.T) {
+	before := imapUIDFingerprint([]string{"* SEARCH 10 20 30"}, 16)
+	after := imapUIDFingerprint([]string{"* SEARCH 10 25 30"}, 16)
+	if before == after {
+		t.Fatalf("same max UID reclassification was missed: %q", before)
+	}
+	if got := imapUIDFingerprint([]string{"* SEARCH 1 2 3 4"}, 2); got != "3,4" {
+		t.Fatalf("bounded fingerprint=%q, want 3,4", got)
+	}
+}

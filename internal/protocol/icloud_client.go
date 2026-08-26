@@ -35,12 +35,13 @@ type ICloudRemoteMailbox struct {
 }
 
 type ICloudSyncedMessage struct {
-	RemoteID   string
-	UID        string
-	Subject    string
-	From       string
-	Body       string
-	ReceivedAt time.Time
+	RemoteID           string
+	UID                string
+	Subject            string
+	From               string
+	Body               string
+	ReceivedAt         time.Time
+	ProviderReceivedAt time.Time
 }
 
 type ICloudMailCleanupResult struct {
