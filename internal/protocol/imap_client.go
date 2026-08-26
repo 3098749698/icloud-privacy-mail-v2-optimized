@@ -470,6 +470,12 @@ func WatchICloudIMAPExists(ctx context.Context, state LoginState, onReady, onExi
 	return watchICloudIMAPMailboxExists(ctx, state, "INBOX", nil, "", 0, onReady, onExists, nil)
 }
 
+// WatchICloudIMAPMessages fetches newly visible Inbox UIDs on the same
+// authenticated connection that receives EXISTS, avoiding a second full scan.
+func WatchICloudIMAPMessages(ctx context.Context, state LoginState, mailboxes []Mailbox, keyword string, maxMessages int, onReady func(), onMessages func(map[string][]ICloudSyncedMessage) error) error {
+	return watchICloudIMAPMailboxExists(ctx, state, "INBOX", mailboxes, keyword, maxMessages, onReady, nil, onMessages)
+}
+
 // WatchICloudIMAPJunkExists keeps a second QQ IMAP connection selected on the
 // Junk folder. INBOX IDLE does not receive EXISTS events for messages that QQ
 // classifies directly as junk.
@@ -551,21 +557,21 @@ func watchICloudIMAPMailboxExists(ctx context.Context, state LoginState, watchFo
 	lastExists := imapExistsCount(selectLines)
 	lastUID := imapSelectLastUID(selectLines)
 	watchingJunk := strings.EqualFold(strings.TrimSpace(watchFolder), "junk")
-	lastJunkFingerprint := ""
-	var lastJunkUIDs []int
-	if watchingJunk {
+	lastFingerprint := ""
+	var lastUIDs []int
+	if watchingJunk || onMessages != nil {
 		searchTag := nextTag()
 		lines, searchErr := imapCommand(conn, reader, searchTag, "UID SEARCH ALL")
 		if searchErr != nil {
 			return searchErr
 		}
-		lastJunkUIDs = imapRecentUIDs(lines, 32)
-		lastJunkFingerprint = imapUIDValuesFingerprint(lastJunkUIDs)
+		lastUIDs = imapRecentUIDs(lines, 32)
+		lastFingerprint = imapUIDValuesFingerprint(lastUIDs)
 		if currentUID := imapMaxUID(lines); currentUID > lastUID {
 			lastUID = currentUID
 		}
 	}
-	probeJunk := func() error {
+	probeSelectedFolder := func() error {
 		searchTag := nextTag()
 		lines, searchErr := imapCommand(conn, reader, searchTag, "UID SEARCH ALL")
 		if searchErr != nil {
@@ -574,10 +580,10 @@ func watchICloudIMAPMailboxExists(ctx context.Context, state LoginState, watchFo
 		currentUID := imapMaxUID(lines)
 		currentUIDs := imapRecentUIDs(lines, 32)
 		fingerprint := imapUIDValuesFingerprint(currentUIDs)
-		changed := currentUID > lastUID || (lastJunkFingerprint != "" && fingerprint != lastJunkFingerprint)
-		addedUIDs := imapUIDDifference(currentUIDs, lastJunkUIDs)
-		lastJunkUIDs = currentUIDs
-		lastJunkFingerprint = fingerprint
+		changed := currentUID > lastUID || (lastFingerprint != "" && fingerprint != lastFingerprint)
+		addedUIDs := imapUIDDifference(currentUIDs, lastUIDs)
+		lastUIDs = currentUIDs
+		lastFingerprint = fingerprint
 		if currentUID > lastUID {
 			lastUID = currentUID
 		}
@@ -590,7 +596,11 @@ func watchICloudIMAPMailboxExists(ctx context.Context, state LoginState, watchFo
 				fetchLimit = qqJunkEventFetchMax
 			}
 			addedUIDs = lastIntValues(addedUIDs, fetchLimit)
-			fetched, fetchErr := fetchSelectedIMAPUIDs(conn, reader, nextTag, addedUIDs, "junk")
+			folder := "inbox"
+			if watchingJunk {
+				folder = "junk"
+			}
+			fetched, fetchErr := fetchSelectedIMAPUIDs(conn, reader, nextTag, addedUIDs, folder)
 			if fetchErr != nil {
 				return fetchErr
 			}
@@ -626,7 +636,7 @@ func watchICloudIMAPMailboxExists(ctx context.Context, state LoginState, watchFo
 			}
 			if errors.Is(err, errIMAPIdleRenew) {
 				if watchingJunk {
-					if probeErr := probeJunk(); probeErr != nil {
+					if probeErr := probeSelectedFolder(); probeErr != nil {
 						return probeErr
 					}
 				}
@@ -635,8 +645,8 @@ func watchICloudIMAPMailboxExists(ctx context.Context, state LoginState, watchFo
 			return err
 		}
 		_ = conn.SetReadDeadline(time.Time{})
-		if watchingJunk {
-			if probeErr := probeJunk(); probeErr != nil {
+		if watchingJunk || onMessages != nil {
+			if probeErr := probeSelectedFolder(); probeErr != nil {
 				return probeErr
 			}
 		} else if onExists != nil {

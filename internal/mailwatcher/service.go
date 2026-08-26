@@ -479,35 +479,27 @@ func (s *Service) runIdleWorker(ctx context.Context, group watchGroup, target id
 				requestIdleSync(readySignals)
 			}
 		}
-		onExists := func() {
+		onMessages := func(messages map[string][]protocol.ICloudSyncedMessage) error {
 			if workerCtx.Err() != nil {
-				return
+				return workerCtx.Err()
 			}
 			s.updateStatus(func(status *Status) {
 				status.IdleEvents++
 				status.LastIdleEventAt = time.Now()
 			})
-			// Return immediately so the IMAP connection re-enters IDLE while the
-			// per-worker sync loop fetches mail on its own connection. A buffered
-			// request preserves one trailing sync when EXISTS arrives mid-sync.
-			requestIdleSync(eventRequests)
+			startedAt := time.Now()
+			count, applyErr := s.mailbox.ApplyIMAPEventMessages(group.mailboxes, messages)
+			s.recordSyncResult(count, applyErr)
+			if applyErr == nil && count > 0 {
+				s.log.Info("IMAP 监听连接精准写入", "账号", group.session.AppleID, "目录", target.folder, "邮件数", count, "落库耗时", time.Since(startedAt))
+			}
+			return applyErr
 		}
 		var err error
 		if target.folder == idleFolderJunk {
-			err = protocol.WatchICloudIMAPJunkMessages(workerCtx, group.state, group.mailboxes, "OpenAI", mailWatcherIdleFetchLimit(s.cfg.MailWatcherFetchLimit), onReady, func(messages map[string][]protocol.ICloudSyncedMessage) error {
-				if workerCtx.Err() != nil {
-					return workerCtx.Err()
-				}
-				s.updateStatus(func(status *Status) {
-					status.IdleEvents++
-					status.LastIdleEventAt = time.Now()
-				})
-				count, applyErr := s.mailbox.ApplyIMAPEventMessages(group.mailboxes, messages)
-				s.recordSyncResult(count, applyErr)
-				return applyErr
-			})
+			err = protocol.WatchICloudIMAPJunkMessages(workerCtx, group.state, group.mailboxes, "OpenAI", mailWatcherIdleFetchLimit(s.cfg.MailWatcherFetchLimit), onReady, onMessages)
 		} else {
-			err = protocol.WatchICloudIMAPExists(workerCtx, group.state, onReady, onExists)
+			err = protocol.WatchICloudIMAPMessages(workerCtx, group.state, group.mailboxes, "OpenAI", mailWatcherIdleFetchLimit(s.cfg.MailWatcherFetchLimit), onReady, onMessages)
 		}
 		s.markWorkerReady(target.key, token, false)
 		if workerCtx.Err() != nil {
