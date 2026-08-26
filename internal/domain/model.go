@@ -1,0 +1,369 @@
+package domain
+
+import (
+	"encoding/json"
+	"time"
+)
+
+const SchemaVersion = 7
+
+const (
+	StatusActive    = "active"
+	StatusAvailable = "available"
+	StatusReserved  = "reserved"
+	StatusUsed      = "used"
+	StatusFailed    = "failed"
+	StatusDisabled  = "disabled"
+
+	MailboxLeaseClaimed   = "claimed"
+	MailboxLeaseCommitted = "committed"
+	MailboxLeaseReleased  = "released"
+	MailboxLeaseExpired   = "expired"
+
+	ICloudStatusActive       = "active"
+	ICloudStatusNeedLogin    = "need_login"
+	ICloudStatusNeed2FA      = "need_2fa"
+	ICloudStatusNoICloudPlus = "no_icloud_plus"
+	ICloudStatusRateLimited  = "rate_limited"
+	ICloudStatusFailed       = "failed"
+
+	LoginStateICloudWeb    = "icloud_web"
+	LoginStateAppleAccount = "apple_account"
+	LoginStateICloudIMAP   = "icloud_imap"
+
+	SchedulerTaskWaiting   = "waiting"
+	SchedulerTaskRunning   = "running"
+	SchedulerTaskPaused    = "paused"
+	SchedulerTaskCompleted = "completed"
+)
+
+type State struct {
+	SchemaVersion       int               `json:"schema_version"`
+	NextID              int               `json:"next_id"`
+	Admin               *Admin            `json:"admin,omitempty"`
+	Sessions            []WebSession      `json:"sessions,omitempty"`
+	AppleAccounts       []AppleAccount    `json:"apple_accounts,omitempty"`
+	AppleCredentials    []AppleCredential `json:"apple_credentials,omitempty"`
+	Mailboxes           []Mailbox         `json:"mailboxes,omitempty"`
+	MailboxLeases       []MailboxLease    `json:"mailbox_leases,omitempty"`
+	Messages            []Message         `json:"messages,omitempty"`
+	Events              []Event           `json:"events,omitempty"`
+	SchedulerTasks      []SchedulerTask   `json:"scheduler_tasks,omitempty"`
+	Settings            Settings          `json:"settings"`
+	CreateSettings      CreateSettings    `json:"create_settings"`
+	ICloudSessions      []ICloudSession   `json:"icloud_sessions,omitempty"`
+	LegacyICloudSession json.RawMessage   `json:"legacy_icloud_session,omitempty"`
+	LegacyICloudStates  []json.RawMessage `json:"legacy_icloud_sessions,omitempty"`
+	CreatedAt           time.Time         `json:"created_at"`
+	UpdatedAt           time.Time         `json:"updated_at"`
+}
+
+// SchedulerTask is the persisted unit of automatic mailbox creation. Each
+// Apple account has at most one task and keeps its own schedule and progress.
+type SchedulerTask struct {
+	ID                  string               `json:"id"`
+	AccountID           string               `json:"account_id"`
+	AppleID             string               `json:"apple_id,omitempty"`
+	Status              string               `json:"status"`
+	Label               string               `json:"label"`
+	Note                string               `json:"note,omitempty"`
+	CreateChannel       string               `json:"create_channel"`
+	IntervalSeconds     int                  `json:"interval_seconds"`
+	RoundIntervalSecond int                  `json:"round_interval_seconds"`
+	RoundLimit          int                  `json:"round_limit"`
+	Target              int                  `json:"target"`
+	Progress            int                  `json:"progress"`
+	RoundIndex          int                  `json:"round_index"`
+	Success             int                  `json:"success"`
+	Failed              int                  `json:"failed"`
+	LastError           string               `json:"last_error,omitempty"`
+	CompletionReason    string               `json:"completion_reason,omitempty"`
+	CreatedAt           time.Time            `json:"created_at"`
+	UpdatedAt           time.Time            `json:"updated_at"`
+	StartedAt           time.Time            `json:"started_at,omitempty"`
+	LastRunAt           time.Time            `json:"last_run_at,omitempty"`
+	NextRunAt           time.Time            `json:"next_run_at,omitempty"`
+	StoppedAt           time.Time            `json:"stopped_at,omitempty"`
+	CompletedAt         time.Time            `json:"completed_at,omitempty"`
+	Events              []SchedulerTaskEvent `json:"events,omitempty"`
+}
+
+type SchedulerTaskEvent struct {
+	ID        int64     `json:"id"`
+	At        time.Time `json:"at"`
+	Type      string    `json:"type"`
+	Message   string    `json:"message"`
+	MailboxID string    `json:"mailbox_id,omitempty"`
+	Email     string    `json:"email,omitempty"`
+	Error     string    `json:"error,omitempty"`
+}
+
+type Admin struct {
+	ID           string    `json:"id"`
+	Username     string    `json:"username"`
+	PasswordHash string    `json:"password_hash"`
+	CreatedAt    time.Time `json:"created_at"`
+	UpdatedAt    time.Time `json:"updated_at"`
+	LastLoginAt  time.Time `json:"last_login_at,omitempty"`
+}
+
+type WebSession struct {
+	TokenHash  string    `json:"token_hash"`
+	CreatedAt  time.Time `json:"created_at"`
+	LastSeenAt time.Time `json:"last_seen_at"`
+	ExpiresAt  time.Time `json:"expires_at"`
+}
+
+type AppleAccount struct {
+	ID           string    `json:"id"`
+	OwnerID      string    `json:"owner_id,omitempty"`
+	Label        string    `json:"label"`
+	AppleID      string    `json:"apple_id"`
+	Status       string    `json:"status"`
+	ICloudStatus string    `json:"icloud_status"`
+	Note         string    `json:"note"`
+	CreatedAt    time.Time `json:"created_at"`
+	UpdatedAt    time.Time `json:"updated_at"`
+}
+
+// AppleCredential stores only encrypted credentials. It is intentionally kept
+// outside AppleAccount so ordinary account DTOs never expose the ciphertext.
+type AppleCredential struct {
+	AccountID          string    `json:"account_id"`
+	AppleID            string    `json:"apple_id"`
+	PasswordCiphertext string    `json:"password_ciphertext"`
+	TwoFactorMethod    string    `json:"two_factor_method,omitempty"`
+	CreatedAt          time.Time `json:"created_at"`
+	UpdatedAt          time.Time `json:"updated_at"`
+}
+
+type Mailbox struct {
+	ID                  string    `json:"id"`
+	OwnerID             string    `json:"owner_id,omitempty"`
+	AccountID           string    `json:"account_id,omitempty"`
+	AnonymousID         string    `json:"anonymous_id,omitempty"`
+	RemoteOrigin        string    `json:"remote_origin,omitempty"`
+	Label               string    `json:"label"`
+	Email               string    `json:"email"`
+	APIToken            string    `json:"api_token,omitempty"`
+	APIActive           bool      `json:"api_active"`
+	ICloudActive        bool      `json:"icloud_active"`
+	ReceiveCount        int       `json:"receive_count"`
+	Status              string    `json:"status"`
+	Note                string    `json:"note"`
+	ActiveLeaseID       string    `json:"active_lease_id,omitempty"`
+	LastSyncAt          time.Time `json:"last_sync_at,omitempty"`
+	LastSyncUID         string    `json:"last_sync_uid,omitempty"`
+	LastCodeMessageID   string    `json:"last_code_message_id,omitempty"`
+	LastCodeAt          time.Time `json:"last_code_at,omitempty"`
+	ExportedAt          time.Time `json:"exported_at,omitempty"`
+	AutoDeleteAt        time.Time `json:"auto_delete_at,omitempty"`
+	QuotaReleasedAt     time.Time `json:"quota_released_at,omitempty"`
+	DeleteAttempts      int       `json:"delete_attempts,omitempty"`
+	DeleteLastAttemptAt time.Time `json:"delete_last_attempt_at,omitempty"`
+	DeleteRetryAt       time.Time `json:"delete_retry_at,omitempty"`
+	DeleteLastError     string    `json:"delete_last_error,omitempty"`
+	CreatedAt           time.Time `json:"created_at"`
+	UpdatedAt           time.Time `json:"updated_at"`
+}
+
+// MailboxLease 记录外部调用方对邮箱的临时占用，只有提交租约才会把邮箱标记为已使用。
+type MailboxLease struct {
+	ID          string    `json:"id"`
+	MailboxID   string    `json:"mailbox_id"`
+	Email       string    `json:"email"`
+	Project     string    `json:"project"`
+	Purpose     string    `json:"purpose,omitempty"`
+	RequestID   string    `json:"request_id,omitempty"`
+	State       string    `json:"state"`
+	Note        string    `json:"note,omitempty"`
+	ExpiresAt   time.Time `json:"expires_at"`
+	CreatedAt   time.Time `json:"created_at"`
+	UpdatedAt   time.Time `json:"updated_at"`
+	CommittedAt time.Time `json:"committed_at,omitempty"`
+	ReleasedAt  time.Time `json:"released_at,omitempty"`
+	ExpiredAt   time.Time `json:"expired_at,omitempty"`
+}
+
+type Message struct {
+	ID         string    `json:"id"`
+	OwnerID    string    `json:"owner_id,omitempty"`
+	MailboxID  string    `json:"mailbox_id"`
+	RemoteID   string    `json:"remote_id,omitempty"`
+	Source     string    `json:"source,omitempty"`
+	Subject    string    `json:"subject"`
+	From       string    `json:"from"`
+	Body       string    `json:"body"`
+	ReceivedAt time.Time `json:"received_at"`
+	CreatedAt  time.Time `json:"created_at"`
+}
+
+type RemoteMailbox struct {
+	AnonymousID string `json:"anonymous_id,omitempty"`
+	Email       string `json:"email"`
+	Label       string `json:"label,omitempty"`
+	Note        string `json:"note,omitempty"`
+	IsActive    bool   `json:"is_active"`
+	Origin      string `json:"origin,omitempty"`
+}
+
+type Event struct {
+	ID        string    `json:"id"`
+	Level     string    `json:"level"`
+	Category  string    `json:"category"`
+	Message   string    `json:"message"`
+	CreatedAt time.Time `json:"created_at"`
+}
+
+type Settings struct {
+	MailboxPageSize         int    `json:"mailbox_page_size"`
+	EnableMailWatcher       bool   `json:"enable_mail_watcher"`
+	EnableAppleKeepAlive    bool   `json:"enable_apple_keep_alive"`
+	EnablePublicMailboxAPI  bool   `json:"enable_public_mailbox_api"`
+	EnablePublicCodePage    bool   `json:"enable_public_code_page"`
+	PublicAPIKey            string `json:"public_api_key,omitempty"`
+	AppleAccountModuleReady bool   `json:"apple_account_module_ready"`
+	MessageRetentionHours   int    `json:"message_retention_hours"`
+}
+
+type CreateSettings struct {
+	OwnerID                       string    `json:"owner_id,omitempty"`
+	Label                         string    `json:"label,omitempty"`
+	Note                          string    `json:"note,omitempty"`
+	AccountIDs                    []string  `json:"account_ids,omitempty"`
+	CreateChannel                 string    `json:"create_channel,omitempty"`
+	SchedulerCreateChannel        string    `json:"scheduler_create_channel,omitempty"`
+	AppleAccountTwoFactorMethod   string    `json:"apple_account_two_factor_method,omitempty"`
+	ICloudWebTwoFactorMethod      string    `json:"icloud_web_two_factor_method,omitempty"`
+	SchedulerIntervalMinutes      int       `json:"scheduler_interval_minutes,omitempty"`
+	SchedulerRoundIntervalSeconds int       `json:"scheduler_round_interval_seconds,omitempty"`
+	SchedulerRoundLimit           int       `json:"scheduler_round_limit,omitempty"`
+	SchedulerTarget               int       `json:"scheduler_target,omitempty"`
+	MailboxPageSize               int       `json:"mailbox_page_size,omitempty"`
+	UpdatedAt                     time.Time `json:"updated_at,omitempty"`
+}
+
+type ICloudSession struct {
+	OwnerID            string          `json:"owner_id,omitempty"`
+	AccountID          string          `json:"account_id,omitempty"`
+	SavedAt            time.Time       `json:"saved_at"`
+	AppleID            string          `json:"apple_id,omitempty"`
+	DSID               string          `json:"dsid"`
+	ClientID           string          `json:"client_id"`
+	ClientBuildNumber  string          `json:"client_build_number"`
+	MasteringNumber    string          `json:"client_mastering_number"`
+	PremiumMailBaseURL string          `json:"premium_mail_base_url"`
+	MailGatewayBaseURL string          `json:"mail_gateway_base_url,omitempty"`
+	MailBaseURL        string          `json:"mail_base_url,omitempty"`
+	Host               string          `json:"host"`
+	IsICloudPlus       bool            `json:"is_icloud_plus"`
+	CanCreateHME       bool            `json:"can_create_hme"`
+	Cookies            []SessionCookie `json:"cookies,omitempty"`
+	LoginStates        []LoginState    `json:"login_states,omitempty"`
+	Note               string          `json:"note,omitempty"`
+	LastCheckedAt      time.Time       `json:"last_checked_at,omitempty"`
+	LastCheckOK        bool            `json:"last_check_ok,omitempty"`
+	LastStatusMessage  string          `json:"last_status_message,omitempty"`
+}
+
+type LoginState struct {
+	Kind                string          `json:"kind"`
+	Host                string          `json:"host,omitempty"`
+	Origin              string          `json:"origin,omitempty"`
+	SavedAt             time.Time       `json:"saved_at,omitempty"`
+	Cookies             []SessionCookie `json:"cookies,omitempty"`
+	Scnt                string          `json:"scnt,omitempty"`
+	SessionID           string          `json:"session_id,omitempty"`
+	SessionToken        string          `json:"session_token,omitempty"`
+	TrustToken          string          `json:"trust_token,omitempty"`
+	APIKey              string          `json:"api_key,omitempty"`
+	DataAccessToken     string          `json:"data_access_token,omitempty"`
+	UserAgent           string          `json:"user_agent,omitempty"`
+	Note                string          `json:"note,omitempty"`
+	IMAPEmail           string          `json:"imap_email,omitempty"`
+	IMAPUsername        string          `json:"imap_username,omitempty"`
+	IMAPHost            string          `json:"imap_host,omitempty"`
+	IMAPPort            int             `json:"imap_port,omitempty"`
+	IMAPAppPassword     string          `json:"imap_app_password,omitempty"`
+	IMAPAuthMethod      string          `json:"imap_auth_method,omitempty"`
+	OAuthClientID       string          `json:"oauth_client_id,omitempty"`
+	OAuthAccessToken    string          `json:"oauth_access_token,omitempty"`
+	OAuthRefreshToken   string          `json:"oauth_refresh_token,omitempty"`
+	OAuthTokenExpiresAt time.Time       `json:"oauth_token_expires_at,omitempty"`
+	IMAPLastSyncAt      time.Time       `json:"imap_last_sync_at,omitempty"`
+	IMAPLastSyncUID     string          `json:"imap_last_sync_uid,omitempty"`
+	IMAPJunkLastSyncAt  time.Time       `json:"imap_junk_last_sync_at,omitempty"`
+	IMAPJunkLastSyncUID string          `json:"imap_junk_last_sync_uid,omitempty"`
+	ManageExpiresAt     time.Time       `json:"manage_expires_at,omitempty"`
+	LastCheckedAt       time.Time       `json:"last_checked_at,omitempty"`
+	LastCheckOK         bool            `json:"last_check_ok,omitempty"`
+	LastStatusMessage   string          `json:"last_status_message,omitempty"`
+	ReloginRequired     bool            `json:"relogin_required,omitempty"`
+}
+
+type SessionCookie struct {
+	Name     string  `json:"name"`
+	Value    string  `json:"value"`
+	Domain   string  `json:"domain"`
+	Path     string  `json:"path"`
+	Expires  float64 `json:"expires,omitempty"`
+	Secure   bool    `json:"secure,omitempty"`
+	HTTPOnly bool    `json:"http_only,omitempty"`
+	SameSite string  `json:"same_site,omitempty"`
+}
+
+type Dashboard struct {
+	AppleAccountCount  int     `json:"apple_account_count"`
+	ActiveAccountCount int     `json:"active_account_count"`
+	MailboxCount       int     `json:"mailbox_count"`
+	AvailableCount     int     `json:"available_count"`
+	MessageCount       int     `json:"message_count"`
+	Events             []Event `json:"events"`
+}
+
+type MailboxPage struct {
+	Items      []Mailbox `json:"items"`
+	Page       int       `json:"page"`
+	PageSize   int       `json:"page_size"`
+	Total      int       `json:"total"`
+	TotalPages int       `json:"total_pages"`
+}
+
+type Task struct {
+	ID                       string     `json:"id"`
+	Name                     string     `json:"name"`
+	Description              string     `json:"description"`
+	Status                   string     `json:"status"`
+	Progress                 int        `json:"progress"`
+	Module                   string     `json:"module"`
+	NextRunAt                *time.Time `json:"next_run_at,omitempty"`
+	ScheduledIntervalSeconds int        `json:"scheduled_interval_seconds,omitempty"`
+	JitterPercent            int        `json:"jitter_percent,omitempty"`
+}
+
+func DefaultSettings() Settings {
+	return Settings{
+		MailboxPageSize:         7,
+		EnableMailWatcher:       false,
+		EnableAppleKeepAlive:    false,
+		EnablePublicMailboxAPI:  false,
+		EnablePublicCodePage:    false,
+		AppleAccountModuleReady: true,
+		MessageRetentionHours:   24,
+	}
+}
+
+func DefaultCreateSettings() CreateSettings {
+	return CreateSettings{
+		Label:                         "x",
+		CreateChannel:                 "auto",
+		SchedulerCreateChannel:        "auto",
+		AppleAccountTwoFactorMethod:   "trusted_device",
+		ICloudWebTwoFactorMethod:      "trusted_device",
+		SchedulerIntervalMinutes:      60,
+		SchedulerRoundIntervalSeconds: 5,
+		SchedulerRoundLimit:           20,
+		SchedulerTarget:               750,
+		MailboxPageSize:               7,
+	}
+}
